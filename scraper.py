@@ -1,7 +1,8 @@
 """
-- All Ratings Reviews Scraper
+ Subscriptions - All Ratings Reviews Scraper
 - Saves new reviews to Google Sheets (duplicate-safe)
 - Enriches each review with Shopify Domain from Salesforce Account
+- Captures Loop's reply (if any) for each review
 """
 
 import requests
@@ -43,7 +44,9 @@ HEADERS  = {
 
 SHEET_HEADERS = [
     "review_id", "rating", "store_name", "shopify_domain",
-    "country", "duration", "date", "review", "scraped_at"
+    "country", "duration", "date", "review",
+    "loop_reply", "loop_reply_date",
+    "scraped_at"
 ]
 
 # Locks
@@ -54,15 +57,14 @@ sf_cache_lock = threading.Lock()
 
 total_added     = 0
 seen_ids        = set()
-sf_domain_cache = {}   # {"store name lowercase": "domain.myshopify.com"}
+sf_domain_cache = {}
 
 
 # ════════════════════════════════════════════
-#  SALESFORCE — Load all Account domains
+#  SALESFORCE
 # ════════════════════════════════════════════
 
 def load_sf_domains():
-    """Pull all Accounts with Shopify_Domain__c and cache them."""
     global sf_domain_cache
     print("[SF] Connecting to Salesforce...")
     try:
@@ -91,7 +93,6 @@ def load_sf_domains():
 
 
 def get_domain(store_name):
-    """Case-insensitive lookup of Shopify domain from cache."""
     with sf_cache_lock:
         return sf_domain_cache.get(store_name.strip().lower(), "")
 
@@ -173,12 +174,15 @@ def parse_page(html, rating):
     reviews = []
 
     for div in divs:
+        # ── Review ID ──
         parent    = div.find_parent("div", attrs={"id": re.compile(r"review-\d+")})
         review_id = parent["id"].replace("review-", "") if parent else ""
 
+        # ── Store name ──
         store_span = div.find("span", attrs={"title": True})
         store_name = store_span["title"] if store_span else ""
 
+        # ── Country & Duration ──
         country, duration = "", ""
         sidebar = div.find("div", class_=lambda c: c and "tw-order-1" in c and "tw-space-y-1" in c)
         if sidebar:
@@ -189,26 +193,59 @@ def parse_page(html, rating):
             if len(plain) >= 1: country  = plain[0].get_text(strip=True)
             if len(plain) >= 2: duration = plain[1].get_text(strip=True)
 
+        # ── Date ──
         date_div = div.find("div", class_=lambda c: c and "tw-text-fg-tertiary" in c
                             and "tw-text-body-xs" in c)
         date = date_div.get_text(strip=True) if date_div else ""
 
+        # ── Review text ──
         content = div.find("div", attrs={"data-truncate-content-copy": True})
         text    = content.get_text(separator=" ", strip=True) if content else ""
 
-        # Salesforce domain lookup
+        # ── Loop Reply ──
+        loop_reply      = ""
+        loop_reply_date = ""
+
+        reply_section = div.find("div", attrs={"data-merchant-review-reply": ""})
+        if reply_section:
+            # Reply date — looks for "Loop Solutions Inc replied\nSeptember 15, 2021"
+            reply_meta = reply_section.find(
+                "div", class_=lambda c: c and "tw-text-fg-tertiary" in c and "tw-text-body-xs" in c
+            )
+            if reply_meta:
+                meta_text = reply_meta.get_text(separator="\n", strip=True)
+                # Extract date part (last line usually)
+                lines = [l.strip() for l in meta_text.split("\n") if l.strip()]
+                for line in lines:
+                    # If line looks like a date (contains month names)
+                    if re.search(
+                        r"(January|February|March|April|May|June|July|August|"
+                        r"September|October|November|December)", line
+                    ):
+                        loop_reply_date = line
+                        break
+
+            # Reply text content
+            reply_content = reply_section.find("div", attrs={"data-truncate-content-copy": True})
+            if reply_content:
+                loop_reply = reply_content.get_text(separator=" ", strip=True)
+
+        # ── Salesforce domain ──
         shopify_domain = get_domain(store_name)
 
         reviews.append({
-            "review_id":      review_id,
-            "rating":         rating,
-            "store_name":     store_name,
-            "shopify_domain": shopify_domain,
-            "country":        country,
-            "duration":       duration,
-            "date":           date,
-            "review":         text,
+            "review_id":       review_id,
+            "rating":          rating,
+            "store_name":      store_name,
+            "shopify_domain":  shopify_domain,
+            "country":         country,
+            "duration":        duration,
+            "date":            date,
+            "review":          text,
+            "loop_reply":      loop_reply,
+            "loop_reply_date": loop_reply_date,
         })
+
     return reviews
 
 
@@ -234,6 +271,7 @@ def scrape_page(ws, rating, page_num, retries=3):
             if not reviews:
                 return 0
 
+            # Deduplicate
             new_reviews = []
             with seen_lock:
                 for r in reviews:
@@ -249,7 +287,9 @@ def scrape_page(ws, rating, page_num, retries=3):
                 [
                     r["review_id"], r["rating"], r["store_name"],
                     r["shopify_domain"], r["country"], r["duration"],
-                    r["date"], r["review"], now
+                    r["date"], r["review"],
+                    r["loop_reply"], r["loop_reply_date"],
+                    now
                 ]
                 for r in new_reviews
             ]
@@ -281,14 +321,11 @@ def main():
     print(f"  Mode: {run_mode.upper()} | Threads: {THREADS}")
     print(f"{'='*55}")
 
-    # Step 1: Load Salesforce domain mappings
     load_sf_domains()
 
-    # Step 2: Connect Google Sheet
     ws = connect_sheet()
     load_existing_ids(ws)
 
-    # Step 3: Build task list
     tasks = []
     if run_mode == "update":
         for rating in RATINGS:
@@ -305,8 +342,8 @@ def main():
             time.sleep(1)
         print(f"\n[FULL] Total tasks: {len(tasks)}\n")
 
-    # Step 4: Scrape with thread pool
     start = time.time()
+
     with ThreadPoolExecutor(max_workers=THREADS) as executor:
         futures = {
             executor.submit(scrape_page, ws, r, p): (r, p)
