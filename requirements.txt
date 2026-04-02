@@ -2,4 +2,5 @@ requests
 beautifulsoup4
 gspread
 google-auth
+simple-salesforce
 schedule
