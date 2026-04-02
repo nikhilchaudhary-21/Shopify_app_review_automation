@@ -1,6 +1,7 @@
 """
-Loop Subscriptions - All Ratings Reviews Scraper
-Saves new reviews to Google Sheets (duplicate-safe)
+- All Ratings Reviews Scraper
+- Saves new reviews to Google Sheets (duplicate-safe)
+- Enriches each review with Shopify Domain from Salesforce Account
 """
 
 import requests
@@ -11,18 +12,25 @@ import re
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+import json
 
 import gspread
 from google.oauth2.service_account import Credentials
-import json
+from simple_salesforce import Salesforce
 
-# ── Config from environment variables (set in GitHub Secrets) ──
-SHEET_ID       = os.environ["SHEET_ID"]
-WORKSHEET_NAME = os.environ.get("WORKSHEET_NAME", "Reviews")
-CREDS_JSON     = os.environ["GOOGLE_CREDENTIALS_JSON"]  # full JSON string
+# ── Config from GitHub Secrets ──────────────────────────────
+SHEET_ID          = os.environ["SHEET_ID"]
+WORKSHEET_NAME    = os.environ.get("WORKSHEET_NAME", "Reviews")
+CREDS_JSON        = os.environ["GOOGLE_CREDENTIALS_JSON"]
 
-RATINGS = [5, 4, 3, 2, 1]
-THREADS = 20
+SF_USERNAME       = os.environ["SF_USERNAME"]
+SF_PASSWORD       = os.environ["SF_PASSWORD"]
+SF_SECURITY_TOKEN = os.environ["SF_SECURITY_TOKEN"]
+SF_INSTANCE_URL   = os.environ["SF_INSTANCE_URL"]
+# ────────────────────────────────────────────────────────────
+
+RATINGS  = [5, 4, 3, 2, 1]
+THREADS  = 20
 
 BASE_URL = "https://apps.shopify.com/loop-subscriptions/reviews"
 HEADERS  = {
@@ -34,15 +42,58 @@ HEADERS  = {
 }
 
 SHEET_HEADERS = [
-    "review_id", "rating", "store_name", "country",
-    "duration", "date", "review", "scraped_at"
+    "review_id", "rating", "store_name", "shopify_domain",
+    "country", "duration", "date", "review", "scraped_at"
 ]
 
-sheet_lock   = threading.Lock()
-counter_lock = threading.Lock()
-seen_lock    = threading.Lock()
-total_added  = 0
-seen_ids     = set()
+# Locks
+sheet_lock    = threading.Lock()
+counter_lock  = threading.Lock()
+seen_lock     = threading.Lock()
+sf_cache_lock = threading.Lock()
+
+total_added     = 0
+seen_ids        = set()
+sf_domain_cache = {}   # {"store name lowercase": "domain.myshopify.com"}
+
+
+# ════════════════════════════════════════════
+#  SALESFORCE — Load all Account domains
+# ════════════════════════════════════════════
+
+def load_sf_domains():
+    """Pull all Accounts with Shopify_Domain__c and cache them."""
+    global sf_domain_cache
+    print("[SF] Connecting to Salesforce...")
+    try:
+        sf = Salesforce(
+            username=SF_USERNAME,
+            password=SF_PASSWORD,
+            security_token=SF_SECURITY_TOKEN,
+            instance_url=SF_INSTANCE_URL,
+        )
+        query   = "SELECT Name, Shopify_Domain__c FROM Account WHERE Shopify_Domain__c != null"
+        result  = sf.query_all(query)
+        records = result.get("records", [])
+
+        with sf_cache_lock:
+            for rec in records:
+                name   = (rec.get("Name") or "").strip()
+                domain = (rec.get("Shopify_Domain__c") or "").strip()
+                if name and domain:
+                    sf_domain_cache[name.lower()] = domain
+
+        print(f"[SF] Loaded {len(sf_domain_cache)} store → domain mappings.")
+
+    except Exception as e:
+        print(f"[SF] Error: {e} — domain column will be empty.")
+        sf_domain_cache = {}
+
+
+def get_domain(store_name):
+    """Case-insensitive lookup of Shopify domain from cache."""
+    with sf_cache_lock:
+        return sf_domain_cache.get(store_name.strip().lower(), "")
 
 
 # ════════════════════════════════════════════
@@ -64,7 +115,6 @@ def connect_sheet():
     except gspread.WorksheetNotFound:
         ws = sheet.add_worksheet(title=WORKSHEET_NAME, rows="10000", cols="20")
 
-    # Add header if empty
     existing = ws.row_values(1) if ws.row_count > 0 else []
     if existing != SHEET_HEADERS:
         ws.insert_row(SHEET_HEADERS, 1)
@@ -76,7 +126,7 @@ def connect_sheet():
 def load_existing_ids(ws):
     global seen_ids
     try:
-        all_ids  = ws.col_values(1)[1:]   # skip header
+        all_ids  = ws.col_values(1)[1:]
         seen_ids = set(filter(None, all_ids))
         print(f"[SHEET] {len(seen_ids)} existing review IDs loaded.")
     except Exception as e:
@@ -104,22 +154,14 @@ def append_rows(ws, rows):
 
 def get_total_pages(rating):
     try:
-        resp = requests.get(
-            BASE_URL, params={"ratings[]": rating, "page": 1},
-            headers=HEADERS, timeout=20
-        )
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        # Try aria-label pagination links
+        resp  = requests.get(BASE_URL, params={"ratings[]": rating, "page": 1},
+                             headers=HEADERS, timeout=20)
+        soup  = BeautifulSoup(resp.text, "html.parser")
         pages = soup.find_all("a", attrs={"aria-label": re.compile(r"Page \d+")})
         if pages:
-            nums = [int(re.search(r"\d+", a["aria-label"]).group()) for a in pages]
-            return max(nums)
-
-        # Fallback: next/prev disabled = 1 page
+            return max(int(re.search(r"\d+", a["aria-label"]).group()) for a in pages)
         reviews = soup.find_all("div", attrs={"data-merchant-review": ""})
         return 1 if reviews else 0
-
     except Exception as e:
         print(f"[★{rating}] Page detection error: {e}")
         return 1
@@ -147,16 +189,25 @@ def parse_page(html, rating):
             if len(plain) >= 1: country  = plain[0].get_text(strip=True)
             if len(plain) >= 2: duration = plain[1].get_text(strip=True)
 
-        date_div = div.find("div", class_=lambda c: c and "tw-text-fg-tertiary" in c and "tw-text-body-xs" in c)
-        date     = date_div.get_text(strip=True) if date_div else ""
+        date_div = div.find("div", class_=lambda c: c and "tw-text-fg-tertiary" in c
+                            and "tw-text-body-xs" in c)
+        date = date_div.get_text(strip=True) if date_div else ""
 
         content = div.find("div", attrs={"data-truncate-content-copy": True})
         text    = content.get_text(separator=" ", strip=True) if content else ""
 
+        # Salesforce domain lookup
+        shopify_domain = get_domain(store_name)
+
         reviews.append({
-            "review_id": review_id, "rating": rating,
-            "store_name": store_name, "country": country,
-            "duration": duration, "date": date, "review": text,
+            "review_id":      review_id,
+            "rating":         rating,
+            "store_name":     store_name,
+            "shopify_domain": shopify_domain,
+            "country":        country,
+            "duration":       duration,
+            "date":           date,
+            "review":         text,
         })
     return reviews
 
@@ -183,7 +234,6 @@ def scrape_page(ws, rating, page_num, retries=3):
             if not reviews:
                 return 0
 
-            # Deduplicate
             new_reviews = []
             with seen_lock:
                 for r in reviews:
@@ -196,8 +246,11 @@ def scrape_page(ws, rating, page_num, retries=3):
 
             now  = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
             rows = [
-                [r["review_id"], r["rating"], r["store_name"],
-                 r["country"], r["duration"], r["date"], r["review"], now]
+                [
+                    r["review_id"], r["rating"], r["store_name"],
+                    r["shopify_domain"], r["country"], r["duration"],
+                    r["date"], r["review"], now
+                ]
                 for r in new_reviews
             ]
 
@@ -221,27 +274,28 @@ def scrape_page(ws, rating, page_num, retries=3):
 # ════════════════════════════════════════════
 
 def main():
-    run_mode = os.environ.get("RUN_MODE", "full")   # 'full' or 'update'
+    run_mode = os.environ.get("RUN_MODE", "full")
 
     print(f"{'='*55}")
     print(f"  Loop Reviews Scraper — {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
     print(f"  Mode: {run_mode.upper()} | Threads: {THREADS}")
     print(f"{'='*55}")
 
+    # Step 1: Load Salesforce domain mappings
+    load_sf_domains()
+
+    # Step 2: Connect Google Sheet
     ws = connect_sheet()
     load_existing_ids(ws)
 
+    # Step 3: Build task list
     tasks = []
-
     if run_mode == "update":
-        # Only check pages 1-3 per rating for new reviews
         for rating in RATINGS:
             for page in range(1, 4):
                 tasks.append((rating, page))
         print(f"[UPDATE] Checking pages 1-3 per rating → {len(tasks)} tasks\n")
-
     else:
-        # Full scrape
         print("[FULL] Detecting total pages per rating...")
         for rating in RATINGS:
             pages = get_total_pages(rating)
@@ -251,8 +305,8 @@ def main():
             time.sleep(1)
         print(f"\n[FULL] Total tasks: {len(tasks)}\n")
 
+    # Step 4: Scrape with thread pool
     start = time.time()
-
     with ThreadPoolExecutor(max_workers=THREADS) as executor:
         futures = {
             executor.submit(scrape_page, ws, r, p): (r, p)
