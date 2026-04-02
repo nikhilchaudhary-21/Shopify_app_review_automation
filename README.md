@@ -1,4 +1,4 @@
-# Loop Reviews → Google Sheets Scraper
+# Reviews → Google Sheets Scraper
 
 Automatically scrapes all ratings (1–5) from Loop Subscriptions Shopify app
 and saves new reviews to Google Sheets via GitHub Actions.
@@ -8,7 +8,7 @@ and saves new reviews to Google Sheets via GitHub Actions.
 ## 📁 Files
 
 ```
-loop-reviews-scraper/
+reviews-scraper/
 ├── scraper.py                        # Main scraper
 ├── requirements.txt
 └── .github/
