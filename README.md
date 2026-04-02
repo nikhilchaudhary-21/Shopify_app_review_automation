@@ -61,7 +61,7 @@ Add these 3 secrets:
 
 ### First time — Full Scrape (all pages, all ratings)
 
-Go to **Actions → Loop Reviews Scraper → Run workflow → mode: full**
+Go to **Actions → Reviews Scraper → Run workflow → mode: full**
 
 This scrapes everything and fills your sheet.
 
@@ -72,7 +72,7 @@ It checks pages 1–3 per rating and adds only NEW reviews.
 
 ### Manual Update Run
 
-**Actions → Loop Reviews Scraper → Run workflow → mode: update**
+**Actions → Reviews Scraper → Run workflow → mode: update**
 
 ---
 
