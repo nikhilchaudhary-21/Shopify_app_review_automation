@@ -3,17 +3,7 @@ name: Loop Reviews Scraper
 on:
   schedule:
     - cron: "0 * * * *"   # every 1 hour
-
-  workflow_dispatch:
-    inputs:
-      mode:
-        description: "Run mode"
-        required: true
-        default: "update"
-        type: choice
-        options:
-          - update
-          - full
+  workflow_dispatch:        # manual trigger, no inputs needed
 
 jobs:
   scrape:
@@ -47,5 +37,4 @@ jobs:
           SF_PASSWORD:             ${{ secrets.SF_PASSWORD }}
           SF_SECURITY_TOKEN:       ${{ secrets.SF_SECURITY_TOKEN }}
           SF_INSTANCE_URL:         ${{ secrets.SF_INSTANCE_URL }}
-          RUN_MODE:                ${{ github.event.inputs.mode || 'update' }}
         run: python scraper.py
