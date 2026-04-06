@@ -1,5 +1,5 @@
 """
- Subscriptions - All Ratings Reviews Scraper
+Loop Subscriptions - All Ratings Reviews Scraper
 - Saves new reviews to Google Sheets (duplicate-safe)
 - Enriches each review with Shopify Domain from Salesforce Account
 - Captures Loop's reply (if any) for each review
@@ -118,8 +118,8 @@ def connect_sheet():
 
     existing = ws.row_values(1) if ws.row_count > 0 else []
     if existing != SHEET_HEADERS:
-        ws.insert_row(SHEET_HEADERS, 1)
-        print("[SHEET] Header row added.")
+        ws.update("A1", [SHEET_HEADERS])
+        print("[SHEET] Header row updated.")
 
     return ws
 
@@ -208,24 +208,22 @@ def parse_page(html, rating):
 
         reply_section = div.find("div", attrs={"data-merchant-review-reply": ""})
         if reply_section:
-            # Reply date — looks for "Loop Solutions Inc replied\nSeptember 15, 2021"
             reply_meta = reply_section.find(
                 "div", class_=lambda c: c and "tw-text-fg-tertiary" in c and "tw-text-body-xs" in c
             )
             if reply_meta:
                 meta_text = reply_meta.get_text(separator="\n", strip=True)
-                # Extract date part (last line usually)
                 lines = [l.strip() for l in meta_text.split("\n") if l.strip()]
                 for line in lines:
-                    # If line looks like a date (contains month names)
                     if re.search(
                         r"(January|February|March|April|May|June|July|August|"
                         r"September|October|November|December)", line
                     ):
                         loop_reply_date = line
                         break
+                else:
+                    print(f"[WARN] Could not parse reply date for review {review_id}: {lines}")
 
-            # Reply text content
             reply_content = reply_section.find("div", attrs={"data-truncate-content-copy": True})
             if reply_content:
                 loop_reply = reply_content.get_text(separator=" ", strip=True)
@@ -314,11 +312,9 @@ def scrape_page(ws, rating, page_num, retries=3):
 # ════════════════════════════════════════════
 
 def main():
-    run_mode = os.environ.get("RUN_MODE", "full")
-
     print(f"{'='*55}")
     print(f"  Loop Reviews Scraper — {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
-    print(f"  Mode: {run_mode.upper()} | Threads: {THREADS}")
+    print(f"  Threads: {THREADS}")
     print(f"{'='*55}")
 
     load_sf_domains()
@@ -327,20 +323,14 @@ def main():
     load_existing_ids(ws)
 
     tasks = []
-    if run_mode == "update":
-        for rating in RATINGS:
-            for page in range(1, 4):
-                tasks.append((rating, page))
-        print(f"[UPDATE] Checking pages 1-3 per rating → {len(tasks)} tasks\n")
-    else:
-        print("[FULL] Detecting total pages per rating...")
-        for rating in RATINGS:
-            pages = get_total_pages(rating)
-            print(f"  ★{rating} → {pages} pages")
-            for page in range(1, pages + 1):
-                tasks.append((rating, page))
-            time.sleep(1)
-        print(f"\n[FULL] Total tasks: {len(tasks)}\n")
+    print("[FULL] Detecting total pages per rating...")
+    for rating in RATINGS:
+        pages = get_total_pages(rating)
+        print(f"  ★{rating} → {pages} pages")
+        for page in range(1, pages + 1):
+            tasks.append((rating, page))
+        time.sleep(1)
+    print(f"\n[FULL] Total tasks: {len(tasks)}\n")
 
     start = time.time()
 
