@@ -2,9 +2,9 @@ name: Loop Reviews Scraper
 
 on:
   schedule:
-    # Runs once every day at 00:00 UTC (05:30 AM IST)
-    - cron: "0 0 * * *"
-  workflow_dispatch:        # Allows you to run it manually anytime
+    # Runs twice a day (00:00 and 12:00 UTC)
+    - cron: "0 0,12 * * *"
+  workflow_dispatch:        
 
 jobs:
   scrape:
@@ -35,12 +35,9 @@ jobs:
 
       - name: Run scraper
         env:
-          # Google Sheets Secrets
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           WORKSHEET_NAME: ${{ secrets.WORKSHEET_NAME }}
-          
-          # Salesforce Secrets
           SF_USERNAME: ${{ secrets.SF_USERNAME }}
           SF_PASSWORD: ${{ secrets.SF_PASSWORD }}
           SF_SECURITY_TOKEN: ${{ secrets.SF_SECURITY_TOKEN }}
