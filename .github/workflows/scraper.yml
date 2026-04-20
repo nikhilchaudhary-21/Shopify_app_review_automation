@@ -2,8 +2,9 @@ name: Loop Reviews Scraper
 
 on:
   schedule:
-    - cron: "0 * * * *"   # every 1 hour
-  workflow_dispatch:        # manual trigger, no inputs needed
+    # Runs once every day at 00:00 UTC (05:30 AM IST)
+    - cron: "0 0 * * *"
+  workflow_dispatch:        # Allows you to run it manually anytime
 
 jobs:
   scrape:
@@ -11,7 +12,7 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -19,22 +20,29 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Cache pip
+      - name: Cache pip dependencies
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Run scraper
         env:
-          SHEET_ID:                ${{ secrets.SHEET_ID }}
+          # Google Sheets Secrets
+          SHEET_ID: ${{ secrets.SHEET_ID }}
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
-          WORKSHEET_NAME:          ${{ secrets.WORKSHEET_NAME }}
-          SF_USERNAME:             ${{ secrets.SF_USERNAME }}
-          SF_PASSWORD:             ${{ secrets.SF_PASSWORD }}
-          SF_SECURITY_TOKEN:       ${{ secrets.SF_SECURITY_TOKEN }}
-          SF_INSTANCE_URL:         ${{ secrets.SF_INSTANCE_URL }}
+          WORKSHEET_NAME: ${{ secrets.WORKSHEET_NAME }}
+          
+          # Salesforce Secrets
+          SF_USERNAME: ${{ secrets.SF_USERNAME }}
+          SF_PASSWORD: ${{ secrets.SF_PASSWORD }}
+          SF_SECURITY_TOKEN: ${{ secrets.SF_SECURITY_TOKEN }}
+          SF_INSTANCE_URL: ${{ secrets.SF_INSTANCE_URL }}
         run: python scraper.py
