@@ -33,7 +33,8 @@ SF_INSTANCE_URL   = os.environ["SF_INSTANCE_URL"]
 RATINGS  = [5, 4, 3, 2, 1]
 THREADS  = 20
 
-BASE_URL = "https://apps.shopify.com/loop-subscriptions/reviews"
+SITE_ROOT = "https://apps.shopify.com"
+BASE_URL  = f"{SITE_ROOT}/loop-subscriptions/reviews"
 HEADERS  = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                   "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -46,7 +47,7 @@ SHEET_HEADERS = [
     "review_id", "rating", "store_name", "shopify_domain",
     "country", "duration", "date", "review",
     "loop_reply", "loop_reply_date",
-    "scraped_at"
+    "scraped_at", "review_link"
 ]
 
 # Locks
@@ -168,15 +169,35 @@ def get_total_pages(rating):
         return 1
 
 
+def build_review_link(div, review_id):
+    """
+    Per-review permalink. The working form is the share-link
+    (https://apps.shopify.com/reviews/<id>); the /loop-subscriptions/reviews/<id>
+    form 404s. Prefer the real data-review-share-link attr, fall back to review_id.
+    """
+    share_btn = div.find(attrs={"data-review-share-link": True})
+    if share_btn:
+        href = share_btn["data-review-share-link"].strip()
+        return SITE_ROOT + href if href.startswith("/") else href
+    if review_id:
+        return f"{SITE_ROOT}/reviews/{review_id}"
+    return ""
+
+
 def parse_page(html, rating):
     soup    = BeautifulSoup(html, "html.parser")
     divs    = soup.find_all("div", attrs={"data-merchant-review": ""})
     reviews = []
 
     for div in divs:
-        # ── Review ID ──
+        # ── Review ID (parent wrapper first, then content-id fallback) ──
         parent    = div.find_parent("div", attrs={"id": re.compile(r"review-\d+")})
         review_id = parent["id"].replace("review-", "") if parent else ""
+        if not review_id:
+            review_id = (div.get("data-review-content-id") or "").strip()
+
+        # ── Review link ──
+        review_link = build_review_link(div, review_id)
 
         # ── Store name ──
         store_span = div.find("span", attrs={"title": True})
@@ -242,6 +263,7 @@ def parse_page(html, rating):
             "review":          text,
             "loop_reply":      loop_reply,
             "loop_reply_date": loop_reply_date,
+            "review_link":     review_link,
         })
 
     return reviews
@@ -287,7 +309,7 @@ def scrape_page(ws, rating, page_num, retries=3):
                     r["shopify_domain"], r["country"], r["duration"],
                     r["date"], r["review"],
                     r["loop_reply"], r["loop_reply_date"],
-                    now
+                    now, r["review_link"]
                 ]
                 for r in new_reviews
             ]
