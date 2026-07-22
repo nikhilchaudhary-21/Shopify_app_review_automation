@@ -1,8 +1,13 @@
 """
-Loop Subscriptions - All Ratings Reviews Scraper
+Loop Subscriptions - All Ratings Reviews Scraper (v2 — with archive reconcile)
 - Saves new reviews to Google Sheets (duplicate-safe)
 - Enriches each review with Shopify Domain from Salesforce Account
 - Captures Loop's reply (if any) for each review
+- NEW: tracks per-review 'status' (Live / Archived) + 'status_checked_at'.
+  Every run scrapes the FULL live listing, then reconciles: any review_id in
+  the sheet that is no longer live on the app store is marked "Archived".
+  A completeness guard ensures we NEVER mark rows Archived off an incomplete
+  scrape (a failed page or broken page-detection skips marking entirely).
 """
 
 import requests
@@ -12,7 +17,7 @@ import time
 import re
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 
 import gspread
@@ -31,7 +36,12 @@ SF_INSTANCE_URL   = os.environ["SF_INSTANCE_URL"]
 # ────────────────────────────────────────────────────────────
 
 RATINGS  = [5, 4, 3, 2, 1]
-THREADS  = 20
+THREADS  = 10
+
+# Reconcile safety: if the full live scrape yields fewer unique live IDs than
+# this, OR any page hard-fails / page-detection breaks, we DO NOT mark anything
+# Archived (an incomplete scrape must never wipe live reviews to "Archived").
+MIN_EXPECTED_LIVE = 500
 
 SITE_ROOT = "https://apps.shopify.com"
 BASE_URL  = f"{SITE_ROOT}/loop-subscriptions/reviews"
@@ -47,18 +57,40 @@ SHEET_HEADERS = [
     "review_id", "rating", "store_name", "shopify_domain",
     "country", "duration", "date", "review",
     "loop_reply", "loop_reply_date",
-    "scraped_at", "review_link"
+    "scraped_at", "review_link",
+    "status", "status_checked_at",
 ]
+# Column letters for the two status columns (must match header order above)
+STATUS_COL     = "M"   # 13th column
+STATUS_TS_COL  = "N"   # 14th column
 
 # Locks
 sheet_lock    = threading.Lock()
 counter_lock  = threading.Lock()
 seen_lock     = threading.Lock()
 sf_cache_lock = threading.Lock()
+live_lock     = threading.Lock()
 
 total_added     = 0
 seen_ids        = set()
 sf_domain_cache = {}
+
+# Reconcile state
+live_ids_this_run = set()               # every review_id seen LIVE during this run
+scrape_incomplete = threading.Event()   # set if any page hard-fails / detection breaks
+incomplete_reasons = []                 # human-readable reasons (for the log)
+incomplete_lock   = threading.Lock()
+
+
+def mark_incomplete(reason):
+    """Flag the run as incomplete so archive-marking is skipped."""
+    with incomplete_lock:
+        incomplete_reasons.append(reason)
+    scrape_incomplete.set()
+
+
+def now_utc():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 # ════════════════════════════════════════════
@@ -86,10 +118,10 @@ def load_sf_domains():
                 if name and domain:
                     sf_domain_cache[name.lower()] = domain
 
-        print(f"[SF] Loaded {len(sf_domain_cache)} store → domain mappings.")
+        print(f"[SF] Loaded {len(sf_domain_cache)} store -> domain mappings.")
 
     except Exception as e:
-        print(f"[SF] Error: {e} — domain column will be empty.")
+        print(f"[SF] Error: {e} - domain column will be empty.")
         sf_domain_cache = {}
 
 
@@ -119,7 +151,8 @@ def connect_sheet():
 
     existing = ws.row_values(1) if ws.row_count > 0 else []
     if existing != SHEET_HEADERS:
-        ws.update("A1", [SHEET_HEADERS])
+        # Named args => works on both gspread 5.x and 6.x (signature order changed).
+        ws.update(range_name="A1", values=[SHEET_HEADERS], value_input_option="USER_ENTERED")
         print("[SHEET] Header row updated.")
 
     return ws
@@ -150,23 +183,113 @@ def append_rows(ws, rows):
     return 0
 
 
+def reconcile_status(ws):
+    """
+    After a FULL live scrape, mark every sheet row Live/Archived by comparing
+    its review_id against the set of IDs seen live this run.
+
+    Guard: if the scrape was incomplete (a page hard-failed, page-detection
+    broke, or too few live IDs were collected) we skip marking entirely so an
+    incomplete run can never flip live reviews to "Archived".
+    """
+    live_count = len(live_ids_this_run)
+    print(f"\n[RECONCILE] Live IDs seen this run: {live_count}")
+
+    if scrape_incomplete.is_set():
+        print("[RECONCILE] SKIPPED - scrape flagged incomplete:")
+        for r in incomplete_reasons:
+            print(f"            - {r}")
+        print("[RECONCILE] No status columns were written (safety guard).")
+        return
+
+    if live_count < MIN_EXPECTED_LIVE:
+        print(f"[RECONCILE] SKIPPED - only {live_count} live IDs "
+              f"(< MIN_EXPECTED_LIVE={MIN_EXPECTED_LIVE}). Refusing to mark archived.")
+        return
+
+    try:
+        sheet_ids = ws.col_values(1)   # includes header at index 0
+    except Exception as e:
+        print(f"[RECONCILE] Could not read review_id column: {e} - skipped.")
+        return
+
+    data_ids = sheet_ids[1:]           # drop header
+    if not data_ids:
+        print("[RECONCILE] No data rows to reconcile.")
+        return
+
+    ts = now_utc()
+    values = []           # one [status, status_checked_at] pair per data row
+    n_live = n_arch = 0
+    for rid in data_ids:
+        rid = (rid or "").strip()
+        if not rid:
+            values.append(["", ""])    # keep blank rows untouched-ish
+            continue
+        if rid in live_ids_this_run:
+            values.append(["Live", ts])
+            n_live += 1
+        else:
+            values.append(["Archived", ts])
+            n_arch += 1
+
+    last_row = 1 + len(values)         # header is row 1, data starts row 2
+    cell_range = f"{STATUS_COL}2:{STATUS_TS_COL}{last_row}"
+
+    with sheet_lock:
+        for attempt in range(1, 4):
+            try:
+                ws.update(range_name=cell_range, values=values,
+                          value_input_option="USER_ENTERED")
+                break
+            except Exception as e:
+                print(f"[RECONCILE] Write error (attempt {attempt}): {e}")
+                time.sleep(5 * attempt)
+        else:
+            print("[RECONCILE] FAILED to write status columns after retries.")
+            return
+
+    print(f"[RECONCILE] Done -> Live: {n_live} | Archived: {n_arch} "
+          f"(range {cell_range})")
+
+
 # ════════════════════════════════════════════
 #  SCRAPING
 # ════════════════════════════════════════════
 
-def get_total_pages(rating):
-    try:
-        resp  = requests.get(BASE_URL, params={"ratings[]": rating, "page": 1},
-                             headers=HEADERS, timeout=20)
-        soup  = BeautifulSoup(resp.text, "html.parser")
-        pages = soup.find_all("a", attrs={"aria-label": re.compile(r"Page \d+")})
-        if pages:
-            return max(int(re.search(r"\d+", a["aria-label"]).group()) for a in pages)
-        reviews = soup.find_all("div", attrs={"data-merchant-review": ""})
-        return 1 if reviews else 0
-    except Exception as e:
-        print(f"[★{rating}] Page detection error: {e}")
-        return 1
+def get_total_pages(rating, retries=4):
+    """
+    Robust page-count detection. On persistent failure we FLAG the run
+    incomplete (instead of silently returning 1) so reconcile is skipped.
+    """
+    for attempt in range(1, retries + 1):
+        try:
+            resp = requests.get(BASE_URL, params={"ratings[]": rating, "page": 1},
+                                headers=HEADERS, timeout=25)
+            if resp.status_code == 429:
+                time.sleep(10 * attempt)
+                continue
+            if resp.status_code != 200:
+                time.sleep(3 * attempt)
+                continue
+
+            soup    = BeautifulSoup(resp.text, "html.parser")
+            reviews = soup.find_all("div", attrs={"data-merchant-review": ""})
+            if not reviews:
+                return 0   # genuinely no reviews for this rating (e.g. 2-star)
+
+            pages = soup.find_all("a", attrs={"aria-label": re.compile(r"Page \d+")})
+            if pages:
+                return max(int(re.search(r"\d+", a["aria-label"]).group()) for a in pages)
+            return 1       # reviews exist but no pager => single page
+
+        except Exception as e:
+            print(f"[*{rating}] Page detection error (attempt {attempt}): {e}")
+            time.sleep(3 * attempt)
+
+    mark_incomplete(f"page-detection failed for rating {rating}")
+    print(f"[*{rating}] Page detection FAILED after {retries} attempts - run flagged incomplete.")
+    return 0
 
 
 def build_review_link(div, review_id):
@@ -214,10 +337,16 @@ def parse_page(html, rating):
             if len(plain) >= 1: country  = plain[0].get_text(strip=True)
             if len(plain) >= 2: duration = plain[1].get_text(strip=True)
 
-        # ── Date ──
-        date_div = div.find("div", class_=lambda c: c and "tw-text-fg-tertiary" in c
-                            and "tw-text-body-xs" in c)
-        date = date_div.get_text(strip=True) if date_div else ""
+        # ── Date (restricted to the review body, NOT the reply block) ──
+        reply_section_probe = div.find("div", attrs={"data-merchant-review-reply": ""})
+        date = ""
+        for cand in div.find_all("div", class_=lambda c: c and "tw-text-fg-tertiary" in c
+                                 and "tw-text-body-xs" in c):
+            # skip any date node that lives inside the reply section
+            if reply_section_probe and reply_section_probe in cand.parents:
+                continue
+            date = cand.get_text(strip=True)
+            break
 
         # ── Review text ──
         content = div.find("div", attrs={"data-truncate-content-copy": True})
@@ -269,7 +398,7 @@ def parse_page(html, rating):
     return reviews
 
 
-def scrape_page(ws, rating, page_num, retries=3):
+def scrape_page(ws, rating, page_num, retries=4):
     global total_added
 
     for attempt in range(1, retries + 1):
@@ -277,7 +406,7 @@ def scrape_page(ws, rating, page_num, retries=3):
             resp = requests.get(
                 BASE_URL,
                 params={"ratings[]": rating, "page": page_num},
-                headers=HEADERS, timeout=20
+                headers=HEADERS, timeout=25
             )
 
             if resp.status_code == 429:
@@ -291,7 +420,13 @@ def scrape_page(ws, rating, page_num, retries=3):
             if not reviews:
                 return 0
 
-            # Deduplicate
+            # ── Collect LIVE ids (every review seen live this run, new or old) ──
+            with live_lock:
+                for r in reviews:
+                    if r["review_id"]:
+                        live_ids_this_run.add(r["review_id"])
+
+            # Deduplicate against what's already in the sheet
             new_reviews = []
             with seen_lock:
                 for r in reviews:
@@ -302,14 +437,15 @@ def scrape_page(ws, rating, page_num, retries=3):
             if not new_reviews:
                 return 0
 
-            now  = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+            now  = now_utc()
             rows = [
                 [
                     r["review_id"], r["rating"], r["store_name"],
                     r["shopify_domain"], r["country"], r["duration"],
                     r["date"], r["review"],
                     r["loop_reply"], r["loop_reply_date"],
-                    now, r["review_link"]
+                    now, r["review_link"],
+                    "Live", now,                       # status, status_checked_at
                 ]
                 for r in new_reviews
             ]
@@ -319,13 +455,16 @@ def scrape_page(ws, rating, page_num, retries=3):
                 total_added += added
                 current      = total_added
 
-            print(f"[★{rating} P{page_num:>3}] ✅ +{added} new | Total: {current}")
+            print(f"[*{rating} P{page_num:>3}] +{added} new | Total: {current}")
             return added
 
         except Exception as e:
-            print(f"[★{rating} P{page_num}] Error (attempt {attempt}): {e}")
+            print(f"[*{rating} P{page_num}] Error (attempt {attempt}): {e}")
             time.sleep(4 * attempt)
 
+    # All retries exhausted -> this page's live reviews are unknown -> incomplete.
+    mark_incomplete(f"page fetch failed: rating {rating}, page {page_num}")
+    print(f"[*{rating} P{page_num}] FAILED after {retries} attempts - run flagged incomplete.")
     return 0
 
 
@@ -335,7 +474,7 @@ def scrape_page(ws, rating, page_num, retries=3):
 
 def main():
     print(f"{'='*55}")
-    print(f"  Loop Reviews Scraper — {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"  Loop Reviews Scraper (v2) - {now_utc()}")
     print(f"  Threads: {THREADS}")
     print(f"{'='*55}")
 
@@ -348,7 +487,7 @@ def main():
     print("[FULL] Detecting total pages per rating...")
     for rating in RATINGS:
         pages = get_total_pages(rating)
-        print(f"  ★{rating} → {pages} pages")
+        print(f"  *{rating} -> {pages} pages")
         for page in range(1, pages + 1):
             tasks.append((rating, page))
         time.sleep(1)
@@ -366,12 +505,17 @@ def main():
                 future.result()
             except Exception as e:
                 r, p = futures[future]
-                print(f"[★{r} P{p}] Unhandled: {e}")
+                print(f"[*{r} P{p}] Unhandled: {e}")
+
+    # Reconcile Live/Archived status across the whole sheet
+    reconcile_status(ws)
 
     elapsed = time.time() - start
     print(f"\n{'='*55}")
-    print(f"  ✅ Done! New reviews added: {total_added}")
-    print(f"  ⏱  Time: {elapsed:.1f}s")
+    print(f"  Done! New reviews added: {total_added}")
+    print(f"  Live IDs this run: {len(live_ids_this_run)}")
+    print(f"  Scrape complete: {not scrape_incomplete.is_set()}")
+    print(f"  Time: {elapsed:.1f}s")
     print(f"{'='*55}")
 
 
